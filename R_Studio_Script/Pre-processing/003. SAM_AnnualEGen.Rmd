@@ -1,0 +1,253 @@
+---
+title: "Electricity Generation (SAM)"
+output: html_document
+date: "2025-12-23"
+---
+
+# ============================================================
+# Electricity Generation (SAM) — Bootstrap weighted MA average
+# ------------------------------------------------------------
+# Goal:
+#   - Combine multiple SAM simulation points across MA using
+#     ecoregion area weights (pixel counts)
+#   - Propagate spatial sampling uncertainty via bootstrap
+# Output:
+#   - Bootstrap draws of annual generation (kWh/MWdc) for project
+#     years 2–31 (Year 1 treated as installation year)
+#   - Saved as: sam_generation_bootstrap.rds
+# ============================================================
+
+```{r}
+
+# ------------------------------------------------------------
+# 1) Load SAM annual generation table
+# ------------------------------------------------------------
+# Expected format (Solar_Generation_1222.xlsx):
+#   - Column 1: project year index (1..31)
+#   - Remaining columns: SAM points grouped by ecoregion
+library(readxl)
+Annual_SAM <- read_xlsx("Solar_Generation_1222.xlsx")
+
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 2) Define ecoregion weights and column groups
+# ------------------------------------------------------------
+# w_ecoreg: relative area weights based on pixel counts (or any
+#           area proxy) for each EPA Level-3 ecoregion in MA.
+# idx_*   : column indices in Annual_SAM corresponding to SAM
+#           sample points for each ecoregion.
+library(dplyr)
+
+w_ecoreg <- c(
+  NH   = 8657,   # Northeastern Highlands (58)
+  NCZ  = 41657,  # Northeastern Coastal Zone (59)
+  NECP = 6028    # Atlantic Coastal Pine Barrens (84)
+)
+w_ecoreg <- w_ecoreg / sum(w_ecoreg)  # normalize to sum to 1
+
+idx_NH   <- 2:6
+idx_NCZ  <- 7:16
+idx_NECP <- 17:21
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 3) Prepare SAM table (keep Year 2–31 only)
+# ------------------------------------------------------------
+# - Rename first column as year_idx
+# - Keep project years 2..31 (exclude Year 1 = installation year)
+sam <- Annual_SAM %>%
+  rename(year_idx = 1) %>%
+  mutate(year_idx = as.integer(year_idx)) %>%
+  filter(year_idx >= 2, year_idx <= 31) %>%
+  arrange(year_idx)
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 4) Bootstrap function: weighted MA annual generation
+# ------------------------------------------------------------
+# Bootstrap scheme:
+#   - For each replicate:
+#       * resample SAM point columns WITHIN each ecoregion
+#       * compute rowMeans (annual mean across resampled points)
+#       * combine ecoregion means using w_ecoreg
+# Returns:
+#   - year_idx: vector (Year 2–31)
+#   - reps:    matrix [n_rep x n_year] of bootstrap draws
+bootstrap_weighted_generation <- function(sam_df,
+                                          idx_NH, idx_NCZ, idx_NECP,
+                                          w_ecoreg,
+                                          n_rep = 1000,
+                                          seed = 42) {
+  set.seed(seed)
+
+  # Ecoregion matrices: rows = years, cols = SAM points
+  M_NH   <- as.matrix(sam_df[, idx_NH,   drop = FALSE])
+  M_NCZ  <- as.matrix(sam_df[, idx_NCZ,  drop = FALSE])
+  M_NECP <- as.matrix(sam_df[, idx_NECP, drop = FALSE])
+
+  n_year <- nrow(sam_df)
+  out <- matrix(NA_real_, nrow = n_rep, ncol = n_year)
+
+  for (r in seq_len(n_rep)) {
+    # Resample columns within each ecoregion (same #cols, with replacement)
+    s_NH   <- sample(seq_len(ncol(M_NH)),   size = ncol(M_NH),   replace = TRUE)
+    s_NCZ  <- sample(seq_len(ncol(M_NCZ)),  size = ncol(M_NCZ),  replace = TRUE)
+    s_NECP <- sample(seq_len(ncol(M_NECP)), size = ncol(M_NECP), replace = TRUE)
+
+    # Annual mean generation per ecoregion for this replicate
+    mu_NH   <- rowMeans(M_NH[,   s_NH,   drop = FALSE], na.rm = TRUE)
+    mu_NCZ  <- rowMeans(M_NCZ[,  s_NCZ,  drop = FALSE], na.rm = TRUE)
+    mu_NECP <- rowMeans(M_NECP[, s_NECP, drop = FALSE], na.rm = TRUE)
+
+    # Area-weighted MA mean generation (kWh/MWdc)
+    out[r, ] <- w_ecoreg["NH"]   * mu_NH +
+                w_ecoreg["NCZ"]  * mu_NCZ +
+                w_ecoreg["NECP"] * mu_NECP
+  }
+
+  list(
+    year_idx = sam_df$year_idx,
+    reps = out
+  )
+}
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 5) Run bootstrap + summarize uncertainty by project year
+# ------------------------------------------------------------
+res <- bootstrap_weighted_generation(
+  sam_df  = sam,
+  idx_NH  = idx_NH,
+  idx_NCZ = idx_NCZ,
+  idx_NECP = idx_NECP,
+  w_ecoreg = w_ecoreg,
+  n_rep = 1000,
+  seed  = 42
+)
+
+year_idx <- res$year_idx
+reps     <- res$reps
+
+summary_tbl <- tibble(
+  year_idx = year_idx,
+  gen_mean = colMeans(reps, na.rm = TRUE),
+  gen_lo   = apply(reps, 2, quantile, probs = 0.025, na.rm = TRUE),
+  gen_hi   = apply(reps, 2, quantile, probs = 0.975, na.rm = TRUE)
+)
+
+summary_tbl
+
+```
+
+```{r}
+# ------------------------------------------------------------
+# 6) Plot: MA annual generation with 95% interval
+# ------------------------------------------------------------
+library(ggplot2)
+library(scales)
+
+ggplot(summary_tbl, aes(x = year_idx, y = gen_mean)) +
+  geom_ribbon(aes(ymin = gen_lo, ymax = gen_hi), alpha = 0.2) +
+  geom_line(linewidth = 0.9) +
+  scale_y_continuous(labels = scales::label_scientific()) +
+  labs(
+    x = "Project year (Year 2–31; Year 1 = installation year)",
+    y = "Annual generation across MA (kWh/MWdc)"
+  ) +
+  theme_bw()
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 7) Save bootstrap draws for downstream Monte Carlo model
+# ------------------------------------------------------------
+sam_bootstrap <- list(
+  SAM_Bootstrap_MA = reps,     # matrix [n_rep x n_year]
+  year_idx = year_idx,         # project year (2–31)
+  weights  = w_ecoreg,         # ecoregion weights (sum to 1)
+  n_rep    = nrow(reps)
+)
+
+#saveRDS(sam_bootstrap, file = "sam_generation_bootstrap.rds")
+
+```
+
+
+```{r}
+
+# ------------------------------------------------------------
+# 8) (Optional) Ecoregion-specific mean generation (no bootstrap)
+# ------------------------------------------------------------
+# Computes simple rowMeans by ecoregion, useful for diagnostics
+# or plotting ecoregion curves side-by-side.
+library(dplyr)
+library(ggplot2)
+
+calc_ecoregion_means <- function(sam_df, idx_NH, idx_NCZ, idx_NECP) {
+
+  M_NH   <- as.matrix(sam_df[, idx_NH,   drop = FALSE])
+  M_NCZ  <- as.matrix(sam_df[, idx_NCZ,  drop = FALSE])
+  M_NECP <- as.matrix(sam_df[, idx_NECP, drop = FALSE])
+
+  tibble(
+    project_year = sam_df$year_idx,
+    NH   = rowMeans(M_NH,   na.rm = TRUE),
+    NCZ  = rowMeans(M_NCZ,  na.rm = TRUE),
+    NECP = rowMeans(M_NECP, na.rm = TRUE)
+  )
+}
+
+gen_ecoreg_mean <- calc_ecoregion_means(
+  sam_df  = sam,
+  idx_NH  = idx_NH,
+  idx_NCZ = idx_NCZ,
+  idx_NECP = idx_NECP
+)
+
+
+```
+
+```{r}
+# ------------------------------------------------------------
+# 9) (Optional) Plot: ecoregion-specific mean generation curves
+# ------------------------------------------------------------
+
+library(tidyr)
+library(scales)
+
+gen_long <- gen_ecoreg_mean %>%
+  pivot_longer(cols = c(NH, NCZ, NECP),
+               names_to = "ecoregion",
+               values_to = "generation")
+
+ggplot(gen_long, aes(x = project_year, y = generation, color = ecoregion)) +
+  scale_color_manual(values = c(NH = "steelblue", NCZ = "darkgreen", NECP = "sienna")) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.3) +
+  scale_y_continuous(labels = scales::label_scientific(digits = 2)) +
+  labs(
+    x = "Project year",
+    y = "Annual electricity generation (kWh/MWdc)",
+    color = "Ecoregion"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "top"
+  )
+
+```

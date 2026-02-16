@@ -1,0 +1,337 @@
+---
+title: "rFIA_app"
+output: html_document
+date: "2026-02-15"
+---
+
+```{r}
+# ============================================================
+# FIA-based biomass growth estimation (Massachusetts)
+# - Data source: rFIA (US Forest Service FIA plots)
+# - Output:
+#     1) Annual mean biomass carbon density (MgC/ha)
+#     2) Logarithmic and linear trend fits (WLS)
+#     3) Model comparison (AIC/BIC, weighted R²)
+#     4) Parametric bootstrap uncertainty for linear growth slope
+# ============================================================
+
+# Install once (if needed)
+# install.packages(c("rFIA","dplyr","readr","ggplot2"))
+
+```
+
+```{r}
+# Load required packages
+library(rFIA)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(minpack.lm)  # nlsLM
+```
+
+```{r}
+# Download Massachusetts FIA database (saved locally)
+#fia <- getFIA(states = "MA", dir = "data/fia_ma", load = TRUE)
+
+# Save locally for reuse
+#save(fia, file = "fia_MA.RData")
+
+```
+
+```{r}
+# Load previously saved FIA object
+#load(file = "fia_MA.RData")
+
+```
+
+
+```{r}
+# ------------------------------------------------------------
+# 1) Annual biomass carbon density (design-based FIA estimate)
+# ------------------------------------------------------------
+# Unit conversion: short ton/acre → Mg/ha
+k_stac_to_MgHa <- 2.2417023
+
+bio_year <- biomass(
+  fia,
+  landType   = "forest",
+  treeDomain = STATUSCD == 1
+) %>%
+  as_tibble() %>%
+  select(YEAR, CARB_ACRE, CARB_ACRE_SE) %>%
+  filter(YEAR >= 2005, YEAR <= 2024) %>%
+  mutate(
+    mu = CARB_ACRE    * k_stac_to_MgHa,  # Mean MgC/ha
+    SE = CARB_ACRE_SE * k_stac_to_MgHa   # Standard error
+  ) %>%
+  transmute(YEAR, mu, SE)
+
+
+```
+
+```{r}
+# ------------------------------------------------------------
+# 2) Prepare weighted least squares (WLS) dataset
+# ------------------------------------------------------------
+
+d <- bio_year %>% 
+  arrange(YEAR) %>% 
+  mutate(
+    T = YEAR - min(YEAR) + 1,   # Relative time index (avoid log(0))
+    w = 1 / (SE^2 + 1e-12)      # WLS weights (inverse variance)
+  )
+
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 3) Logarithmic growth model (level form)
+#     mu = a + b * ln(T)
+# ------------------------------------------------------------
+fit_log_lvl <- lm(mu ~ log(T), data = d, weights = w)
+
+summary(fit_log_lvl)
+AIC(fit_log_lvl); BIC(fit_log_lvl)
+coef(fit_log_lvl)
+
+# Predicted annual values
+d_pred <- d %>%
+  mutate(mu_hat = as.numeric(predict(fit_log_lvl, newdata = d))) %>%
+  select(YEAR, mu, SE, mu_hat)
+
+d_pred
+
+# ------------------------------------------------------------
+# Visualization: Logarithmic fit
+# ------------------------------------------------------------
+grid <- tibble(
+  YEAR = seq(min(d$YEAR), max(d$YEAR), by = 0.1)
+) %>%
+  mutate(
+    T = YEAR - min(d$YEAR) + 1,
+    mu_hat = as.numeric(predict(fit_log_lvl, newdata = data.frame(T = T)))
+  )
+
+d_plot <- d %>%
+  mutate(mu_hat = as.numeric(predict(fit_log_lvl, newdata = data.frame(T = T))))
+
+ggplot() +
+  geom_ribbon(
+    data = d_plot,
+    aes(x = YEAR, ymin = mu - 1.96 * SE, ymax = mu + 1.96 * SE),
+    alpha = 0.15
+  ) +
+  geom_point(
+    data = d_plot,
+    aes(x = YEAR, y = mu),
+    size = 1.8, alpha = 0.8
+  ) +
+  geom_line(
+    data = grid,
+    aes(x = YEAR, y = mu_hat),
+    linewidth = 1.1
+  ) +
+  labs(
+    title = "MA annual mean biomass (FIA) — Logarithmic fit",
+    x = "Year",
+    y = "Biomass carbon density (MgC/ha)"
+  ) +
+  theme_minimal(base_size = 12)
+
+
+```
+
+
+```{r}
+
+# ------------------------------------------------------------
+# 4) Linear growth model
+#     mu = a + b*T
+# ------------------------------------------------------------
+fit_lin <- lm(mu ~ T, data = d, weights = w)
+
+summary(fit_lin)
+AIC(fit_lin); BIC(fit_lin)
+coef(fit_lin)
+
+# Visualization: Linear fit
+grid_lin <- tibble(
+  YEAR = seq(min(d$YEAR), max(d$YEAR), by = 0.1)
+) %>%
+  mutate(
+    T = YEAR - min(d$YEAR) + 1,
+    mu_hat_lin = as.numeric(predict(fit_lin, newdata = data.frame(T = T)))
+  )
+
+ggplot() +
+  geom_ribbon(
+    data = d,
+    aes(x = YEAR, ymin = mu - 1.96 * SE, ymax = mu + 1.96 * SE),
+    alpha = 0.15
+  ) +
+  geom_point(
+    data = d,
+    aes(x = YEAR, y = mu),
+    size = 1.8, alpha = 0.8
+  ) +
+  geom_line(
+    data = grid_lin,
+    aes(x = YEAR, y = mu_hat_lin),
+    linewidth = 1.1
+  ) +
+  labs(
+    title = "MA annual mean biomass — Linear fit",
+    x = "Year",
+    y = "Biomass carbon density (MgC/ha)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 5) Model comparison: Weighted R²
+# ------------------------------------------------------------
+r2_weighted <- function(fit, data){
+  y <- data$mu
+  w <- data$w
+  yhat <- as.numeric(predict(fit, newdata = data))
+  ybar_w <- sum(w * y) / sum(w)
+  1 - sum(w * (y - yhat)^2) / sum(w * (y - ybar_w)^2)
+}
+
+r2_log <- r2_weighted(fit_log_lvl, d)
+r2_lin <- r2_weighted(fit_lin, d)
+
+
+# 2) log vs linear
+grid_all <- tibble(
+  YEAR = seq(min(d$YEAR), max(d$YEAR), by = 0.1)
+) %>%
+  mutate(T = YEAR - min(d$YEAR) + 1,
+         mu_hat_log = as.numeric(predict(fit_log_lvl, newdata = data.frame(T = T))),
+         mu_hat_lin = as.numeric(predict(fit_lin,     newdata = data.frame(T = T)))) %>%
+  pivot_longer(cols = starts_with("mu_hat_"),
+               names_to = "model", values_to = "mu_hat") %>%
+  mutate(model = recode(model,
+                        mu_hat_log = "Logarithmic",
+                        mu_hat_lin = "Linear"))
+
+# 3) Legend
+labels_models <- c(
+  "Logarithmic" = sprintf("Logarithmic fit (R² = %.3f)", r2_log),
+  "Linear"      = sprintf("Linear fit (R² = %.3f)",      r2_lin)
+)
+
+# 4) Plot
+ggplot() +
+  # SE ribbon
+  geom_ribbon(
+    data = d,
+    aes(x = YEAR, ymin = mu - 1.96 * SE, ymax = mu + 1.96 * SE),
+    alpha = 0.15, show.legend = FALSE
+  ) +
+  # Mean
+  geom_point(
+    data = d,
+    aes(x = YEAR, y = mu),
+    size = 1.8, alpha = 0.8, show.legend = FALSE
+  ) +
+  # Predictive line
+  geom_line(
+    data = grid_all,
+    aes(x = YEAR, y = mu_hat, color = model),
+    linewidth = 1.1
+  ) +
+  scale_color_discrete(name = "Model fits",
+                       labels = labels_models,
+                       breaks = c("Logarithmic", "Linear")) +
+  labs(
+    title = "MA Annual Mean Biomass (FIA plots): Logarithmic vs Linear fits",
+    x = "Year",
+    y = "Biomass carbon density (MgC/ha)"
+  ) +
+  scale_x_continuous(breaks = seq(min(d$YEAR), max(d$YEAR), by = 2)) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+
+```{r}
+
+# ------------------------------------------------------------
+# 6) Parametric bootstrap (linear slope uncertainty)
+#     mu_sim ~ N(mu_hat, SE^2)
+# ------------------------------------------------------------
+set.seed(98)
+
+mu_hat <- as.numeric(predict(fit_lin, newdata = d))
+
+B <- 1000
+ab_boot <- matrix(NA_real_, nrow = B, ncol = 2)
+colnames(ab_boot) <- c("a","b")
+
+for (i in 1:B) {
+  mu_sim <- rnorm(nrow(d), mean = mu_hat, sd = d$SE)
+  fit_i <- try(lm(mu_sim ~ d$T, weights = d$w), silent = TRUE)
+  if (!inherits(fit_i, "try-error")) {
+    ab_boot[i, ] <- coef(fit_i)
+  }
+}
+
+ab_boot <- ab_boot[complete.cases(ab_boot), , drop = FALSE]
+n_eff <- nrow(ab_boot)
+n_eff
+
+# Bootstrap summary statistics (mean, SD, 95% percentile CI)
+summ <- function(x) c(
+  mean = mean(x),
+  sd = sd(x),
+  q2.5 = quantile(x, .025),
+  q50 = quantile(x, .5),
+  q97.5 = quantile(x, .975)
+)
+
+boot_summary <- rbind(
+  a = summ(ab_boot[, "a"]),
+  b = summ(ab_boot[, "b"])
+)
+
+
+# ------------------------------------------------------------
+# 7) Bootstrap distribution of annual growth rate (slope b)
+# ------------------------------------------------------------
+b_draws <- as.numeric(ab_boot[, "b"])
+b_draws <- b_draws[is.finite(b_draws)]
+
+mean_b <- mean(b_draws)
+sd_b   <- sd(b_draws)
+ci_b   <- quantile(b_draws, c(0.025, 0.975))
+
+ggplot(data.frame(b = b_draws), aes(x = b)) +
+  geom_histogram(bins = 40, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = mean_b, linewidth = 1) +
+  geom_vline(xintercept = ci_b, linetype = "dashed") +
+  labs(
+    title = "Bootstrap distribution of biomass growth rate",
+    subtitle = sprintf(
+      "Mean = %.3f, 95%% CI = [%.3f, %.3f], SD = %.3f",
+      mean_b, ci_b[1], ci_b[2], sd_b
+    ),
+    x = "Annual biomass growth (MgC/ha per year)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+
+# ------------------------------------------------------------
+# 8) Save bootstrap slope draws for carbon model integration
+# ------------------------------------------------------------
+#saveRDS(b_draws, file = "boot_growth2.rds")
+
+```
+
+

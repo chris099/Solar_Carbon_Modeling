@@ -1,0 +1,262 @@
+---
+title: "LCA_Solar_LearningCurve"
+output: html_document
+date: "2025-12-17"
+---
+
+# ============================================================
+# PV LCA Learning Curve
+# ------------------------------------------------------------
+# Goal:
+#   - Compile historical life-cycle carbon intensity (gCO2eq/kWh)
+#     estimates for utility-scale PV from literature
+#   - Link those estimates to global cumulative installed PV capacity
+#   - Estimate a learning curve:
+#         log(CI) ~ log(cumulative capacity)
+#   - Derive implied learning rate (LR)
+#   - Project carbon intensity for 2005–2024
+# ============================================================
+
+```{r}
+
+# ------------------------------------------------------------
+# Literature benchmarks for PV life-cycle carbon intensity
+# (documentation only; actual data read from Excel table)
+# ------------------------------------------------------------
+# Sources include:
+#   - IEA (1999)
+#   - Alsema (2003), Fthenakis & Alsema (2005)
+#   - Jungbluth (2005)
+#   - Querini et al. (2012)
+#   - Nugent & Sovacool (2010)
+#   - NREL (2013)
+#   - IPCC AR5 WG3 (2014)
+#   - Beylot et al. (2014)
+#   - IEA-PVPS Task 12 (2018)
+#   - Fraunhofer ISE (2023)
+#   - NREL utility-scale PV (2024)
+#
+# Values typically reported in gCO2eq/kWh under specified
+# irradiation, efficiency, and performance ratio assumptions.
+
+
+```
+
+```{r}
+# ------------------------------------------------------------
+# 1) Load compiled LCA table
+# ------------------------------------------------------------
+library(readxl)
+lca <- read_xlsx("LCAs_table.xlsx")
+
+
+```
+
+
+```{r}
+
+# ------------------------------------------------------------
+# 2) Clean and rename key LCA columns
+# ------------------------------------------------------------
+# Expected relevant fields:
+#   - year
+#   - module efficiency
+#   - carbon intensity (gCO2eq/kWh)
+colnames(lca)[2] <- "year"
+colnames(lca)[6] <- "efficiency"
+colnames(lca)[7] <- "gCO2_kWh"
+
+# Quick inspection
+lca[, c("year", "efficiency", "gCO2_kWh")]
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 3) Load global cumulative PV capacity (Our World in Data)
+# ------------------------------------------------------------
+library(dplyr)
+
+pv_cap <- read.csv("installed-solar-pv-capacity.csv")
+
+pv_world <- pv_cap %>%
+  filter(Code == "OWID_WRL")  # world aggregate only
+
+head(pv_world)
+
+```
+
+
+```{r}
+
+# ------------------------------------------------------------
+# 4) Prepare cumulative capacity + merge with LCA data
+# ------------------------------------------------------------
+colnames(pv_world)[3] <- "year"
+colnames(pv_world)[4] <- "cum_GW"
+
+pv_world_clean <- pv_world %>%
+  transmute(
+    year   = as.integer(year),
+    cum_GW = as.numeric(cum_GW)
+  ) %>%
+  filter(!is.na(year), !is.na(cum_GW), cum_GW > 0)
+
+lca_lc <- lca %>%
+  transmute(
+    year        = as.integer(lca[[2]]),
+    gCO2_kWh    = as.numeric(lca[[7]])
+  ) %>%
+  filter(!is.na(year), !is.na(gCO2_kWh), gCO2_kWh > 0)
+
+# Merge by publication year
+df_lc <- lca_lc %>%
+  left_join(pv_world_clean, by = "year") %>%
+  filter(!is.na(cum_GW))
+
+```
+
+
+```{r}
+
+# ------------------------------------------------------------
+# 5) Estimate learning curve (log–log regression)
+#     log(CI) = a + b * log(cum_GW)
+# ------------------------------------------------------------
+fit <- lm(log(gCO2_kWh) ~ log(cum_GW), data = df_lc)
+summary(fit)
+
+# Learning exponent
+b  <- coef(fit)[["log(cum_GW)"]]
+
+# Learning rate per doubling of cumulative capacity
+LR <- 1 - 2^b
+
+cat("Slope b =", round(b, 3), "\n")
+cat("Learning rate per doubling =", round(LR * 100, 1), "%\n")
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 6) Log–log plot: data + fitted learning curve
+# ------------------------------------------------------------
+plot(df_lc$cum_GW, df_lc$gCO2_kWh,
+     log = "xy",
+     pch = 19,
+     xlab = "Global cumulative PV capacity (GW)",
+     ylab = "PV life-cycle carbon intensity (gCO2eq/kWh)",
+     main = "PV LCA learning curve (log–log)")
+
+xline <- exp(seq(log(min(df_lc$cum_GW)),
+                 log(max(df_lc$cum_GW)),
+                 length.out = 200))
+yline <- exp(coef(fit)[1]) * xline^b
+lines(xline, yline, lwd = 2)
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 7) Log–log plot with literature labels
+# ------------------------------------------------------------
+plot(df_lc$cum_GW, df_lc$gCO2_kWh,
+     log = "xy",
+     pch = 19,
+     xlim = c(min(df_lc$cum_GW), 30000),
+     xlab = "Global cumulative PV capacity (GW)",
+     ylab = "PV life-cycle carbon intensity (gCO2eq/kWh)",
+     main = "PV LCA learning curve (log–log)")
+
+xline <- exp(seq(log(min(df_lc$cum_GW)),
+                 log(max(df_lc$cum_GW)),
+                 length.out = 200))
+yline <- exp(coef(fit)[1]) * xline^b
+lines(xline, yline, lwd = 2)
+
+# Add reference labels (study names)
+text(df_lc$cum_GW, df_lc$gCO2_kWh,
+     labels = lca[[1]],
+     pos = 4,
+     cex = 0.7,
+     offset = 0.4)
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 8) Predict PV carbon intensity for 2005–2024
+# ------------------------------------------------------------
+pv_0524 <- pv_world_clean %>%
+  filter(year >= 2005, year <= 2024) %>%
+  arrange(year) %>%
+  distinct(year, .keep_all = TRUE)
+
+# Predict in log-space, then exponentiate
+pv_ci_0524 <- pv_0524 %>%
+  mutate(
+    log_CI_hat = predict(fit, newdata = data.frame(cum_GW = cum_GW)),
+    CI_hat_gCO2_kWh = exp(log_CI_hat)
+  ) %>%
+  select(year, cum_GW, CI_hat_gCO2_kWh)
+
+pv_ci_0524
+
+# ------------------------------------------------------------
+# 9) Plot predicted CI (2005–2024) + NREL 2024 reference
+# ------------------------------------------------------------
+library(ggplot2)
+
+nrel2024_ci <- 33  # gCO2eq/kWh (utility-scale PV, 2024)
+
+ggplot(pv_ci_0524, aes(x = year, y = CI_hat_gCO2_kWh)) +
+  geom_col(width = 0.8, fill = "lightgreen") +
+  geom_hline(
+    yintercept = nrel2024_ci,
+    linetype = "dashed",
+    linewidth = 1.1,
+    color = "purple"
+  ) +
+  annotate(
+    "text",
+    x = min(pv_ci_0524$year) + 1,
+    y = nrel2024_ci,
+    label = "(Previous Input) NREL Utility-scale PV LCA (2024)",
+    color = "purple",
+    vjust = 1.5,
+    hjust = 0,
+    size = 6
+  ) +
+  labs(
+    x = "Year",
+    y = expression("Carbon intensity (g CO"[2]*"eq/kWh)")
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+# ------------------------------------------------------------
+# 10) Plot global cumulative capacity (context figure)
+# ------------------------------------------------------------
+ggplot(pv_ci_0524, aes(x = year, y = cum_GW)) +
+  geom_col(width = 0.8, fill = "darkgreen") +
+  labs(
+    x = "Year",
+    y = expression("Cumulative Capacity (GW)")
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+# Optional:
+# saveRDS(pv_ci_0524, file = "pv_ci_0524.rds")
+
+```

@@ -1,0 +1,86 @@
+---
+title: "GRID_Carbon Intensity"
+output: html_document
+date: "2025-12-23"
+---
+
+# ============================================================
+# GRID Carbon Intensity (ISO-NE)
+# ------------------------------------------------------------
+# Scenario 2:
+#   Assume solar generation displaces ISO-NE annual average
+#   grid carbon intensity in the corresponding year.
+# ------------------------------------------------------------
+# Steps:
+#   1) Load ISO-NE carbon intensity data
+#   2) Convert units to gCO2e/kWh
+#   3) Visualize annual grid carbon intensity
+# ============================================================
+
+```{r}
+
+#Scenario 2: Solar replace at ISO-NE annual average CI at that timing
+
+# ------------------------------------------------------------
+# 1) Load ISO-NE annual carbon intensity data
+# ------------------------------------------------------------
+library(dplyr)
+library(readxl)
+
+ISO_NE_CI <- read_xlsx("ISO_NE_CI.xlsx")
+
+# Standardize column names and year format
+ISO_NE_CI <- ISO_NE_CI |>
+  rename_with(tolower) |>
+  mutate(year = as.integer(year))
+
+# Rename CI column and convert units:
+#   Original: lbs CO2e / MWh
+#   Convert to g CO2e / kWh
+#   1 lb = 0.453592 kg = 453.592 g
+#   lbs/MWh × 0.453592 = g/kWh
+ISO_NE_CI <- ISO_NE_CI |>
+  rename(CI_lbs_MWh = 2) |>
+  mutate(
+    CI_gCO2_kWh = CI_lbs_MWh * 0.453592
+  )
+
+# Optional: save processed dataset
+# saveRDS(ISO_NE_CI, file = "ISO_NE_CI.rds")
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 2) Visualization: ISO-NE annual average carbon intensity
+# ------------------------------------------------------------
+barplot(
+  ISO_NE_CI$CI_gCO2_kWh,
+  names.arg = ISO_NE_CI$year,
+  las = 2,
+  border = NA,
+  xlab = "Year",
+  ylab = expression("Grid Carbon Intensity (gCO"[2]*"e / kWh)"),
+  ylim = c(0, 500),
+  main = "ISO-NE Grid Carbon Intensity"
+)
+
+# Reference line:
+# Natural gas combined-cycle plant (NREL 2021)
+abline(
+  h = 486,
+  col = "firebrick",
+  lwd = 2,
+  lty = 2
+)
+
+# Annotate reference line
+text(
+  x = 1,
+  y = 486 - 30,
+  labels = "Natural gas power plant (486 gCO2e/kWh, NREL 2021)",
+  pos = 4,
+  col = "firebrick"
+)
+```

@@ -1,0 +1,133 @@
+---
+title: "Boot_Biomass"
+output: html_document
+date: "2026-02-16"
+---
+
+#============================================================
+# Bootstrap estimation of baseline biomass density
+# - Data source: TreeMap 2016 AGB histogram (MgC/ha)
+# - Goal: Estimate uncertainty of mean biomass density
+#         for solar-converted area using multinomial resampling
+#============================================================
+
+
+```{r}
+# ------------------------------------------------------------
+# 1) Load TreeMap histogram (value + pixel count per bin)
+# ------------------------------------------------------------
+# value  = biomass carbon density (MgC/ha)
+# count  = number of pixels in each bin
+
+hist_df <- read_csv("Treemap_2016AGB_Hist.csv", show_col_types = FALSE) %>%
+  rename(
+    value = `Band Value`,                 # MgC/ha (already converted)
+    count = `CARBON_L_ha Count`           # pixel count
+  ) %>%
+  filter(is.finite(value), is.finite(count), count > 0)
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 2) Convert histogram to probability distribution
+# ------------------------------------------------------------
+
+# Total number of forest pixels
+N_pix <- sum(hist_df$count)
+
+# Probability of each biomass bin
+p   <- hist_df$count / N_pix
+val <- hist_df$value
+
+# ------------------------------------------------------------
+# 3) Define solar-converted area
+# ------------------------------------------------------------
+solar_area_km2 <- 34.626
+
+pixel_size_m     <- 30
+pixel_area_km2   <- (pixel_size_m / 1000)^2
+pixel_area_ha    <- pixel_area_km2 * 100
+
+# Number of pixels corresponding to solar area
+N_solar_pix <- as.integer(round(solar_area_km2 / pixel_area_km2))
+
+# Weighted mean and SD of full histogram (reference)
+sample_mean <- sum(val * p)                       
+sample_sd   <- sqrt(sum(p * (val - sample_mean)^2))
+
+cat("Sampling", N_solar_pix, "pixels (≈",
+    sprintf("%.2f", N_solar_pix * pixel_area_km2), "km^2, ",
+    sprintf("%.2f", N_solar_pix * pixel_area_ha), "ha)\n")
+
+```
+
+```{r}
+
+# ------------------------------------------------------------
+# 4) Multinomial bootstrap resampling
+# ------------------------------------------------------------
+# Each bootstrap draw:
+#   - Sample N_solar_pix pixels from histogram distribution
+#   - Compute mean biomass density (MgC/ha)
+
+set.seed(132)
+B <- 1000L
+
+# Draw multinomial counts for each bin (bins x B)
+counts_mat <- rmultinom(B, size = N_solar_pix, prob = p)
+
+# Bootstrap mean biomass density (MgC/ha)
+boot_biomass_mean_solar <-
+  as.numeric(crossprod(val, counts_mat)) / N_solar_pix
+
+# Save draws for downstream carbon bookkeeping model
+#saveRDS(boot_biomass_mean_solar, "boot_biomass16.rds")
+
+# ------------------------------------------------------------
+# 5) Summary statistics of bootstrap distribution
+# ------------------------------------------------------------
+biomass_mean_summary <- tibble(
+  n_pixels   = N_solar_pix,
+  mean       = mean(boot_biomass_mean_solar),
+  median     = median(boot_biomass_mean_solar),
+  sd         = sd(boot_biomass_mean_solar),
+  ci95_lower = quantile(boot_biomass_mean_solar, .025),
+  ci95_upper = quantile(boot_biomass_mean_solar, .975)
+)
+
+ci_perc <- quantile(boot_biomass_mean_solar, c(0.025, 0.975))
+
+print(biomass_mean_summary)
+
+
+```
+
+
+```{r}
+
+
+# ------------------------------------------------------------
+# 6) Visualization of bootstrap uncertainty
+# ------------------------------------------------------------
+ggplot(data.frame(boot_biomass_mean_solar),
+       aes(x = boot_biomass_mean_solar)) +
+  geom_histogram(bins = 60, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = biomass_mean_summary$mean, linetype = 2) +
+  geom_vline(xintercept = ci_perc, linetype = 3) +
+  labs(
+    title = "Bootstrap distribution of TreeMap 2016 biomass density (MgC/ha)",
+    subtitle = sprintf(
+      "Mean = %.3f, 95%% CI = [%.3f, %.3f], SD = %.3f",
+      biomass_mean_summary$mean,
+      ci_perc[1], ci_perc[2],
+      biomass_mean_summary$sd
+    ),
+    x = "Biomass carbon density (MgC/ha)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
