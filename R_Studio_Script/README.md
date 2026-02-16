@@ -18,6 +18,13 @@ The framework estimates:
 4. Avoided emissions from displaced grid electricity  
 5. Net carbon impact over 2005–2054  
 
+---
+
+## Repository Structure
+
+├── MainCarbonModel/ # Main carbon bookkeeping + LCA model
+├── Pre-processing/ # Input generation and parameter estimation
+└── README.md
 
 ---
 
