@@ -1,6 +1,6 @@
 # Main Carbon Modeling Framework
 
-This directory contains the integrated carbon impact model for utility-scale solar development in Massachusetts.
+This directory contains the integrated carbon model for utility-scale solar development in Massachusetts.
 
 The model combines:
 
