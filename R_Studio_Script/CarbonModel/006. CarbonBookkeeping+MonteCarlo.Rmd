@@ -1,0 +1,1152 @@
+---
+title: "6. CarbonBookkeeping+MonteCarlo"
+output: html_document
+date: "2026-02-15"
+---
+
+```{r}
+
+# ============================================================
+# Setup (load packages once, define shared helpers once)
+# ============================================================
+
+# Global chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# Packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(tibble)
+
+# ------------------------------
+# Shared helper functions
+# ------------------------------
+
+# Draw from Normal but keep positivity
+rnorm_pos <- function(n, mean, sd){
+  x <- rnorm(n, mean, sd)
+  while(any(x <= 0)){
+    i <- which(x <= 0)
+    x[i] <- rnorm(length(i), mean, sd)
+  }
+  x
+}
+
+# Build discrete-time decay convolution matrix (Tlen x Tlen)
+make_L <- function(k, Tlen) {
+  f <- (1 - exp(-k)) * exp(-k * (0:(Tlen - 1)))  # yearly mass to atmosphere
+  L <- matrix(0, Tlen, Tlen)
+  for (j in 1:Tlen) {
+    L[j:Tlen, j] <- f[1:(Tlen - j + 1)]
+  }
+  L
+}
+
+# Matrix (iter x year) -> per-year mean and 95% CI
+mat_to_ci <- function(mat) {
+  yrs <- as.integer(colnames(mat))
+  qs  <- apply(mat, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+  tibble(
+    year = yrs,
+    mean = colMeans(mat, na.rm = TRUE),
+    lo   = as.numeric(qs[1, ]),
+    hi   = as.numeric(qs[2, ])
+  ) %>% arrange(year)
+}
+
+# Summarize a vector with mean and 95% CI half-width
+summ_ci <- function(x) {
+  qs <- quantile(x, c(0.025, 0.975), na.rm = TRUE)
+  m  <- mean(x, na.rm = TRUE)
+  hw <- (qs[2] - qs[1]) / 2
+  list(mean = m, lo = qs[1], hi = qs[2], hw = hw)
+}
+
+# Comma format
+fmt_comma <- function(v) scales::comma(v, accuracy = 1)
+
+# Component plot: bar + ribbon + dashed bounds
+plot_component_ci <- function(df_ci, title, bar_fill, rib_fill, base_size = 18){
+  ggplot(df_ci, aes(x = year, y = mean)) +
+    geom_col(width = 0.9, fill = bar_fill, alpha = 0.95) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), fill = rib_fill, alpha = 0.28) +
+    geom_line(aes(y = lo), linetype = "dashed", linewidth = 0.6) +
+    geom_line(aes(y = hi), linetype = "dashed", linewidth = 0.6) +
+    scale_x_continuous(breaks = pretty(df_ci$year, n = 12)) +
+    labs(
+      title = title,
+      x = "Year",
+      y = expression("Flux (Mg C "*yr^{-1}*")")
+    ) +
+    theme_minimal(base_size = base_size)
+}
+
+# Consistent palettes
+pal_components_main <- c(
+  "Deforestation"   = "#d62728",
+  "Potential Sequestrations"    = "#ff7f0e",
+  "ife Cycle Emissions"     = "#636363",
+  "Carbon Savings" = "#1f77b4"
+)
+
+pal_bio <- c(
+  "Burn" = "#D55E00",
+  "Soft" = "#009E73",
+  "Hard" = "#CC79A7",
+  "Potential Sequestrations" = "#F0E442",
+  "Life Cycle Emissions"  = "#636363",
+  "Carbon Savings" = "#1f77b4"
+)
+
+```
+
+```{r}
+
+# ============================================================
+# 0) Load inputs
+# ============================================================
+
+boot_growth   <- readRDS("boot_growth2.rds")
+boot_AGB16    <- readRDS("boot_biomass16.rds")
+sam_bootstrap <- readRDS("sam_generation_bootstrap.rds")
+
+boot_SAM <- sam_bootstrap$SAM_Bootstrap_MA
+year_idx <- sam_bootstrap$year_idx
+
+ISO_NE_CI          <- readRDS("ISO_NE_CI.rds")
+PV_CarbonIntensity <- readRDS("pv_ci_0524.rds")
+
+# Land area per MWdc (ha/MWdc)
+alpha20 <- 1.75439
+alpha14 <- alpha20 * 1.43
+
+years <- 2005:2024
+alpha_by_year <- data.frame(
+  year = years,
+  alpha = ifelse(years <= 2015, alpha14, alpha20)
+)
+
+alpha_by_year
+
+```
+
+```{r}
+
+# Quick check: land area per capacity over time (step change in 2015)
+plot(
+  alpha_by_year$year,
+  alpha_by_year$alpha,
+  type = "s",
+  lwd  = 3,
+  xlab = "Year",
+  ylab = expression(alpha~"(ha/MWdc)"),
+  main = "Land area per system capacity (step change)"
+)
+
+abline(v = 2015, lty = 2, col = "gray40")
+text(2010, alpha14, "Pre-2015 PV", pos = 3)
+text(2019, alpha20, "Post-2015 PV", pos = 3)
+
+```
+
+```{r}
+
+# ============================================================
+# 1) Biomass bookkeeping MC: emissions (Burn + decay pools)
+# Time period:
+#   - Observed deforestation years: 2005–2024
+#   - Track emissions through: 2054 (30 yrs tail)
+# ============================================================
+
+annual_defo <- read.csv("Annual_Defo_RS.csv") # columns: year, area_km2
+annual_defo$area_ha <- annual_defo$area_km2 * 100
+total_area_obs_ha <- sum(annual_defo$area_ha)
+annual_defo$area_ratio <- annual_defo$area_ha / total_area_obs_ha
+
+annual_defo$year <- as.integer(gsub("[^0-9-]", "", trimws(annual_defo$year)))
+years_hist <- sort(unique(annual_defo$year))  # expected 2005:2024
+end_hist   <- max(years_hist)                 # 2024
+years_tail <- (end_hist + 1):(end_hist + 30)  # 2025:2054
+years_full <- c(years_hist, years_tail)       # 2005:2054
+
+Tlen_hist <- length(years_hist)
+Tlen_full <- length(years_full)
+
+# Total deforestation area uncertainty (Normal)
+# 34.626 km2 ± 3.751 km2  -> 3462.6 ha ± 375.1 ha
+mu_area_ha <- 34.626 * 100
+sd_area_ha <-  3.751 * 100
+
+# MC settings
+set.seed(123)
+n_iter <- 5000
+
+# Draw total deforestation area (ha)
+total_area_draw_ha <- rnorm(n_iter, mean = mu_area_ha, sd = sd_area_ha)
+
+# Allocate annual areas by observed proportions (2005–2024 only)
+area_by_year_hist <- outer(total_area_draw_ha, annual_defo$area_ratio, `*`)  # n_iter x Tlen_hist
+colnames(area_by_year_hist) <- years_hist
+
+# Pad tail years with 0 area (2025–2054)
+area_by_year_ha <- cbind(area_by_year_hist, matrix(0, n_iter, length(years_tail)))
+colnames(area_by_year_ha) <- years_full
+
+# Biomass by year from 2016 baseline + growth (no lower bound)
+dy_full <- years_full - 2016
+
+idx_agb <- sample.int(length(boot_AGB16),  n_iter, replace = TRUE)
+idx_gr  <- sample.int(length(boot_growth), n_iter, replace = TRUE)
+
+agb16_draw <- boot_AGB16[idx_agb]    # MgC/ha
+grow_draw  <- boot_growth[idx_gr]    # MgC/ha/yr
+
+# B: n_iter x Tlen_full (MgC/ha)
+B <- sweep(
+  matrix(rep(dy_full, each = n_iter), nrow = n_iter),
+  1, grow_draw, `*`
+)
+B <- sweep(B, 1, agb16_draw, `+`)
+colnames(B) <- years_full
+
+# Cohort carbon removed in each deforestation year (MgC)
+C <- B * area_by_year_ha  # n_iter x Tlen_full
+
+# Partition at deforestation year
+C_burn0 <- 0.50 * C
+C_soft0 <- 0.25 * C
+C_hard0 <- 0.25 * C
+
+# Sample decay constants per iteration
+k_soft <- rnorm(n_iter, mean = 0.028, sd = 6.4e-5)
+k_hard <- rnorm(n_iter, mean = 0.050, sd = 1.4e-4)
+
+# Emissions per year (MgC/yr) over 2005–2054
+E_burn <- C_burn0
+
+E_soft <- matrix(0, n_iter, Tlen_full)
+E_hard <- matrix(0, n_iter, Tlen_full)
+
+for (i in 1:n_iter) {
+  Ls <- make_L(k_soft[i], Tlen_full)
+  Lh <- make_L(k_hard[i], Tlen_full)
+  E_soft[i, ] <- as.numeric(Ls %*% C_soft0[i, ])
+  E_hard[i, ] <- as.numeric(Lh %*% C_hard0[i, ])
+}
+
+E_total <- E_burn + E_soft + E_hard
+colnames(E_burn) <- colnames(E_soft) <- colnames(E_hard) <- colnames(E_total) <- years_full
+
+```
+
+
+```{r}
+
+# ============================================================
+# 2) Loss of Potential Sequestration (LoPS)
+#   LoPS_y(i) = growth(i) [MgC/ha/yr] * cumulative_area(i, y) [ha]
+# ============================================================
+
+cum_area_ha <- t(apply(area_by_year_ha, 1, cumsum))   # n_iter x Tlen_full
+LOPS <- sweep(cum_area_ha, 1, grow_draw, `*`)         # MgC/yr
+colnames(LOPS) <- years_full
+
+E_total_with_LOPS <- E_total + LOPS
+
+```
+
+```{r}
+
+# ============================================================
+# 3) Solar: LCA + Avoided emissions (cohort-based)
+#   - Allocate installs by observed annual ratios (2005–2024)
+#   - Life Cycle Emissions: applied at install-year (PV CI at install-year)
+#   - Carbon Savings: from next year for pv_life years (grid CI fixed at install-year)
+# ============================================================
+
+alpha_vec <- alpha_by_year$alpha
+names(alpha_vec) <- alpha_by_year$year
+
+pv_ci_vec <- PV_CarbonIntensity$CI_hat_gCO2_kWh
+names(pv_ci_vec) <- PV_CarbonIntensity$year
+
+# Inputs / parameters
+solar_csv <- "Annual_Solar_RS.csv"   # cols: year, area_km2
+
+a1 <- 100      # ha per km^2
+mu_solar_area_km2 <- 41.495
+sd_solar_area_km2 <- 5.026
+
+a2 <- 12/44    # C per CO2eq (unit conversion)
+
+pv_life <- 30
+
+# Read annual solar distribution (observed years only)
+annual_solar <- read.csv(solar_csv, check.names = FALSE, strip.white = TRUE)
+annual_solar$year <- as.integer(gsub("[^0-9-]", "", trimws(annual_solar$year)))
+annual_solar <- annual_solar[order(annual_solar$year), ]
+annual_solar <- annual_solar[annual_solar$year %in% years_hist, ]
+
+annual_solar$area_ha <- annual_solar$area_km2 * a1
+total_solar_obs_ha <- sum(annual_solar$area_ha)
+annual_solar$area_ratio <- if (total_solar_obs_ha > 0) annual_solar$area_ha / total_solar_obs_ha else 0
+
+ratio_solar_hist <- rep(0, length(years_hist)); names(ratio_solar_hist) <- years_hist
+ratio_solar_hist[as.character(annual_solar$year)] <- annual_solar$area_ratio
+
+# Total installed area uncertainty (ha)
+A_total_solar_ha_mc <- rnorm_pos(n_iter, mu_solar_area_km2 * a1, sd_solar_area_km2 * a1)
+
+# Allocate annual installs (ha)
+A_hist_solar_mc_mat <- outer(A_total_solar_ha_mc, ratio_solar_hist, `*`)  # n_iter x Tlen_hist
+A_tail_solar_mc_mat <- matrix(0, n_iter, length(years_tail))
+A_solar_full_mc_mat <- cbind(A_hist_solar_mc_mat, A_tail_solar_mc_mat)
+colnames(A_solar_full_mc_mat) <- years_full
+
+# Match alpha to full time axis (alpha only defined for 2005–2024)
+alpha_full <- rep(NA_real_, length(years_full)); names(alpha_full) <- years_full
+alpha_full[names(alpha_vec)] <- alpha_vec
+
+# MWdc installed per year
+Cap_solar_full_mc_mat <- sweep(
+  A_solar_full_mc_mat, 2,
+  alpha_full[as.character(years_full)],
+  `/`
+)
+colnames(Cap_solar_full_mc_mat) <- years_full
+
+# SAM bootstrap indexing
+idx_sam <- sample.int(nrow(boot_SAM), n_iter, replace = TRUE)
+
+# Lifetime kWh (per 1 MWdc)
+sam_life_kWh_1MW <- rowSums(boot_SAM, na.rm = TRUE)
+
+# Grid CI for avoided
+ISO_vec <- ISO_NE_CI$CI_gCO2_kWh
+names(ISO_vec) <- ISO_NE_CI$year
+
+# Output matrices
+C_solar_mc_mat <- matrix(0, nrow = n_iter, ncol = Tlen_full)
+C_avoided_mc_mat_s2 <- matrix(0, nrow = n_iter, ncol = Tlen_full)
+colnames(C_solar_mc_mat) <- colnames(C_avoided_mc_mat_s2) <- years_full
+
+# --- PV LCA: install-year only ---
+for (j in seq_len(Tlen_hist)) {  # installs only in 2005–2024
+  cap_j <- Cap_solar_full_mc_mat[, j]
+
+  life_kWh <- sam_life_kWh_1MW[idx_sam] * cap_j
+
+  y_install  <- years_full[j]
+  CI_install <- pv_ci_vec[as.character(y_install)]  # gCO2/kWh
+
+  C_solar_mc_mat[, j] <- C_solar_mc_mat[, j] + life_kWh * CI_install * 1e-6 * a2
+}
+
+# --- Avoided: from next year, pv_life years, CI fixed at install-year ---
+for (j in seq_len(Tlen_hist)) {
+  cap_j <- Cap_solar_full_mc_mat[, j]
+
+  start_idx <- j + 1
+  end_idx   <- min(j + pv_life, Tlen_full)
+  span <- end_idx - start_idx + 1
+  if (span <= 0) next
+
+  y_install  <- years_full[j]
+  CI_install <- ISO_vec[as.character(y_install)]  # gCO2/kWh
+
+  sam_block <- boot_SAM[idx_sam, 1:span, drop = FALSE]  # kWh @100MWdc
+  gen_kWh   <- sam_block * cap_j
+
+  C_avoided_mc_mat_s2[, start_idx:end_idx] <-
+    C_avoided_mc_mat_s2[, start_idx:end_idx] +
+    gen_kWh * (-CI_install) * 1e-6 * a2
+}
+
+# Combine: E + LoPS + LCA + Avoided
+TotalAll_mc_mat <- E_total_with_LOPS + C_solar_mc_mat + C_avoided_mc_mat_s2
+colnames(TotalAll_mc_mat) <- years_full
+
+
+```
+
+
+```{r}
+
+# ============================================================
+# 4) Summary tables (means, SDs)
+# ============================================================
+
+emissions_summary <- tibble(
+  year               = years_full,
+  mean_E_MgC_yr      = colMeans(E_total),
+  sd_E_MgC_yr        = apply(E_total, 2, sd),
+  mean_burn_MgC_yr   = colMeans(E_burn),
+  mean_soft_MgC_yr   = colMeans(E_soft),
+  mean_hard_MgC_yr   = colMeans(E_hard),
+  mean_LOPS_MgC_yr   = colMeans(LOPS),
+  sd_LOPS_MgC_yr     = apply(LOPS, 2, sd),
+  mean_LCA_MgC_yr    = colMeans(C_solar_mc_mat),
+  sd_LCA_MgC_yr      = apply(C_solar_mc_mat, 2, sd),
+  mean_Avoided_MgC_yr = colMeans(C_avoided_mc_mat_s2),
+  sd_Avoided_MgC_yr   = apply(C_avoided_mc_mat_s2, 2, sd),
+  mean_TotalAll_MgC_yr = colMeans(TotalAll_mc_mat),
+  sd_TotalAll_MgC_yr   = apply(TotalAll_mc_mat, 2, sd)
+)
+
+head(emissions_summary, 6)
+tail(emissions_summary, 6)
+
+```
+
+
+
+```{r}
+
+
+# ============================================================
+# 7) Biomass (Burn/Soft/Hard) + LoPS stacked
+# ============================================================
+
+df_bio_lops <- tibble(
+  year = as.integer(years_full),
+  Burn = colMeans(E_burn),
+  Soft = colMeans(E_soft),
+  Hard = colMeans(E_hard),
+  LoPS = colMeans(LOPS)
+) %>%
+  pivot_longer(cols = c(Burn, Soft, Hard, LoPS),
+               names_to = "component", values_to = "value")
+
+p_bio_lops_stack <-
+  ggplot(df_bio_lops, aes(x = year, y = value, fill = component)) +
+  geom_col(width = 0.9) +
+  scale_fill_manual(values = c(
+    "Burn" = "#D55E00",      # 즉시배출
+    "Soft" = "#009E73",      # 연질목 분해 배출
+    "Hard" = "#CC79A7",      # 경질목 분해 배출
+    "LoPS" = "#F0E442"       # 상실 포집
+  )) +
+  scale_x_continuous(breaks = pretty(df_bio_lops$year, n = 12)) +
+  labs(
+    title = "Biomass emissions (burn/soft/hard) + LoPS (Loss of Potential Sequestration)",
+    x = "Year",
+    y = expression("Flux (Mg C "*yr^{-1}*")"),
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 20)
+
+#p_bio_lops_stack
+
+library(dplyr)
+library(scales)
+
+# --- 1) Label ---
+
+tot_burn_draw <- rowSums(E_burn, na.rm = TRUE)
+tot_soft_draw <- rowSums(E_soft, na.rm = TRUE)
+tot_hard_draw <- rowSums(E_hard, na.rm = TRUE)
+tot_lops_draw <- rowSums(LOPS,   na.rm = TRUE)
+
+summ_ci <- function(x) {
+  qs <- quantile(x, c(0.025, 0.975), na.rm = TRUE)
+  m  <- mean(x, na.rm = TRUE)
+  hw <- (qs[2] - qs[1]) / 2
+  list(mean = m, lo = qs[1], hi = qs[2], hw = hw)
+}
+
+S_burn <- summ_ci(tot_burn_draw)
+S_soft <- summ_ci(tot_soft_draw)
+S_hard <- summ_ci(tot_hard_draw)
+S_lops <- summ_ci(tot_lops_draw)
+
+# --- 2) Mean ± half-width [lo, hi] ---
+fmt <- function(v) comma(v, accuracy = 1)
+lbl_ci <- paste0(
+  "Totals 2005–2054 (Mg C), 95% CI\n",
+  "Burn: ", fmt(S_burn$mean), " \u00B1 ", fmt(S_burn$hw),"\n",
+  "Soft: ", fmt(S_soft$mean), " \u00B1 ", fmt(S_soft$hw),"\n",
+  "Hard: ", fmt(S_hard$mean), " \u00B1 ", fmt(S_hard$hw),"\n",
+  "LoPS: ", fmt(S_lops$mean), " \u00B1 ", fmt(S_lops$hw)
+)
+
+# --- 3) Placement ---
+y_top <- df_bio_lops |>
+  group_by(year) |>
+  summarise(y_sum = sum(value, na.rm = TRUE), .groups = "drop") |>
+  summarise(max_sum = max(y_sum)) |>
+  pull(max_sum)
+
+# --- 4) Plot+CI box ---
+p_bio_lops_stack_ci <- p_bio_lops_stack +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.30))) +
+  annotate(
+    "label",
+    x = max(df_bio_lops$year) - 0.6,   # 우측에서 약간 안쪽
+    y = y_top * 0.985,                  # 상단에서 살짝 내려
+    hjust = 1, vjust = 1,
+    label = lbl_ci,
+    size = 6,                         # 라벨 글씨 크게
+    label.size = 0.35,
+    fill = "white",
+    alpha = 0.96
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title    = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 17),
+    axis.title    = element_text(size = 18),
+    axis.text     = element_text(size = 14),
+    legend.title  = element_text(size = 17),
+    legend.text   = element_text(size = 15),
+    legend.position = "bottom"
+  )
+
+p_bio_lops_stack_ci
+
+```
+
+```{r}
+
+# ============================================================
+# 8) Total deforestation-related emissions (Burn + Soft + Hard + LoPS)
+# - Build a yearly emissions matrix (MC iterations x years)
+# - Summarize annual mean and 95% CI
+# - Add a text box showing the total (2005–2054) mean ± half-width of 95% CI
+# ============================================================
+
+# ---- 1) Build total deforestation-related emissions matrix ----
+# E_burn / E_soft / E_hard / LOPS are matrices: (n_iter x years_full)
+E_defor_total <- E_burn + E_soft + E_hard + LOPS   # MgC/yr, n_iter x years_full
+
+# ---- 2) Annual summary: mean and 95% CI (for bar + ribbon) ----
+mat_to_ci <- function(mat){
+  qs <- apply(mat, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+  tibble(
+    year = as.integer(colnames(mat)),
+    mean = colMeans(mat, na.rm = TRUE),
+    lo   = as.numeric(qs[1, ]),
+    hi   = as.numeric(qs[2, ])
+  ) %>% arrange(year)
+}
+df_defor_ci <- mat_to_ci(E_defor_total)
+
+# ---- 3) Total (2005–2054): mean ± half-width of the 95% CI ----
+# Compute the distribution of total emissions by summing across years (per iteration)
+tot_defor_draw <- rowSums(E_defor_total, na.rm = TRUE)
+qs <- quantile(tot_defor_draw, c(0.025, 0.975), na.rm = TRUE)
+mu <- mean(tot_defor_draw, na.rm = TRUE)
+hw <- (qs[2] - qs[1]) / 2  # half-width of the 95% CI
+
+lbl_total <- paste0(
+  "Total emissions 2005–2054 (Mg C), 95% CI\n",
+  comma(mu, accuracy = 1), " \u00B1 ", comma(hw, accuracy = 1)
+)
+
+# ---- 4) Plot: annual mean bars + 95% CI ribbon + bounds + totals box ----
+y_max <- max(df_defor_ci$hi, na.rm = TRUE)
+
+p_defor_total <-
+  ggplot(df_defor_ci, aes(x = year, y = mean)) +
+  geom_col(width = 0.9, fill = "grey40", alpha = 0.95) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#6baed6", alpha = 0.25) +
+  geom_line(aes(y = lo), linetype = "dotdash", linewidth = 0.6) +
+  geom_line(aes(y = hi), linetype = "dotdash", linewidth = 0.6) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  scale_x_continuous(breaks = pretty(df_defor_ci$year, n = 12)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.30))) +
+  annotate(
+    "label",
+    x = max(df_defor_ci$year) - 0.6,
+    y = y_max * 0.985,
+    hjust = 1, vjust = 1,
+    label = lbl_total,
+    size = 5.5,
+    label.size = 0.35,
+    fill = "white",
+    alpha = 0.96
+  ) +
+  labs(
+    title = "Total deforestation-related carbon emissions (Burn + Soft + Hard + LoPS)",
+    subtitle = "Annual mean with 95% CI (2005–2054)",
+    x = "Year",
+    y = expression("Flux (Mg C "*yr^{-1}*")")
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title    = element_text(size = 22, face = "bold"),
+    plot.subtitle = element_text(size = 16),
+    axis.title    = element_text(size = 18),
+    axis.text     = element_text(size = 14)
+  )
+
+p_defor_total
+
+
+```
+
+```{r}
+
+# ============================================================
+# Plot 9 — Deforestation component time series (Burn / Soft / Hard / LoPS)
+# - For each component matrix (n_iter x years), compute annual mean and 95% CI
+# - Plot each component as: bar(mean) + ribbon(95% CI) + dashed CI bounds
+# - Also create a faceted 2x2 panel with the same style
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ---- Helper 1: summarize a Monte Carlo matrix into annual mean + 95% CI ----
+# Input:  mat (n_iter x T), columns must be years
+# Output: tibble(year, mean, lo, hi)
+mat_to_ci <- function(mat) {
+  yrs <- as.integer(colnames(mat))
+  qs  <- apply(mat, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+  tibble(
+    year = yrs,
+    mean = colMeans(mat, na.rm = TRUE),
+    lo   = as.numeric(qs[1, ]),
+    hi   = as.numeric(qs[2, ])
+  ) %>% arrange(year)
+}
+
+# ---- Helper 2: single-component plot (bars + 95% CI ribbon + bounds) ----
+plot_component_ci <- function(df_ci, title, bar_fill, rib_fill, base_size = 18){
+  ggplot(df_ci, aes(x = year, y = mean)) +
+    geom_col(width = 0.9, fill = bar_fill, alpha = 0.95) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), fill = rib_fill, alpha = 0.28) +
+    geom_line(aes(y = lo), linetype = "dashed", linewidth = 0.6) +
+    geom_line(aes(y = hi), linetype = "dashed", linewidth = 0.6) +
+    scale_x_continuous(breaks = pretty(df_ci$year, n = 12)) +
+    labs(
+      title = title,
+      x = "Year",
+      y = expression("Flux (Mg C "*yr^{-1}*")")
+    ) +
+    theme_minimal(base_size = base_size)
+}
+
+# ---- 1) Build annual summaries for each component ----
+# Expected inputs: E_burn, E_soft, E_hard, LOPS (each: n_iter x years_full)
+df_burn <- mat_to_ci(E_burn)
+df_soft <- mat_to_ci(E_soft)
+df_hard <- mat_to_ci(E_hard)
+df_lops <- mat_to_ci(LOPS)
+
+# ---- 2) Individual plots (consistent colors by component) ----
+p_burn <- plot_component_ci(df_burn, "Burn (immediate emissions)",          "#D55E00", "#D55E00")
+p_soft <- plot_component_ci(df_soft, "Soft (softwood decay)",               "#009E73", "#009E73")
+p_hard <- plot_component_ci(df_hard, "Hard (hardwood decay)",               "#CC79A7", "#CC79A7")
+p_lops <- plot_component_ci(df_lops, "LoPS (lost potential sequestration)", "#F0E442", "#F0E442")
+
+# ---- 3) Draw individual plots ----
+p_burn; p_soft; p_hard; p_lops
+
+# ---- 4) Combine into one long table and plot as facets (2x2) ----
+df_all <- bind_rows(
+  df_burn %>% mutate(component = "Burn"),
+  df_soft %>% mutate(component = "Soft"),
+  df_hard %>% mutate(component = "Hard"),
+  df_lops %>% mutate(component = "LoPS")
+) %>%
+  mutate(component = factor(component, levels = c("Burn","Soft","Hard","LoPS")))
+
+ggplot(df_all, aes(x = year, y = mean, fill = component)) +
+  geom_col(width = 0.9, alpha = 0.95, show.legend = FALSE) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.28, show.legend = FALSE) +
+  geom_line(aes(y = lo), linetype = "dashed", linewidth = 0.6) +
+  geom_line(aes(y = hi), linetype = "dashed", linewidth = 0.6) +
+  facet_wrap(~ component, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = c(
+    "Burn" = "#D55E00",
+    "Soft" = "#009E73",
+    "Hard" = "#CC79A7",
+    "LoPS" = "#F0E442"
+  )) +
+  scale_x_continuous(breaks = pretty(df_all$year, n = 10)) +
+  labs(
+    title = "Component-wise emissions with 95% CI",
+    x = "Year",
+    y = expression("Flux (Mg C "*yr^{-1}*")")
+  ) +
+  theme_minimal(base_size = 18)
+
+# ---- Optional: save individual panels ----
+# ggsave("02. Burn (immediate) with 95% CI.png", p_burn, width = 9, height = 4, dpi = 300, bg = "white")
+# ggsave("03. Soft (softwood decay) with 95% CI.png", p_soft, width = 9, height = 4, dpi = 300, bg = "white")
+# ggsave("04. Hard (hardwood decay) with 95% CI.png", p_hard, width = 9, height = 4, dpi = 300, bg = "white")
+# ggsave("05. LoPS (lost potential sequestration) with 95% CI.png", p_lops, width = 9, height = 4, dpi = 300, bg = "white")
+
+
+```
+
+
+```{r}
+
+# ============================================================
+# Plot 07 — Stacked annual emissions (Burn + Soft + Hard + LoPS + LCA)
+# - Inputs (MC matrices; n_iter x years_full):
+#   E_burn, E_soft, E_hard, LOPS, C_solar_mc_mat
+# - Steps:
+#   1) Convert annual means into a long table for stacked bars
+#   2) Compute component totals over 2005–2054 and summarize 95% CI (mean ± half-width)
+#   3) Add totals text box to the stacked plot
+#   4) Save figure
+# ============================================================
+
+
+# ---- 1) Annual mean values for stacked bars (one row per year x component) ----
+df_emis_stack <- tibble(
+  year = as.integer(years_full),
+  Burn = colMeans(E_burn,          na.rm = TRUE),
+  Soft = colMeans(E_soft,          na.rm = TRUE),
+  Hard = colMeans(E_hard,          na.rm = TRUE),
+  LoPS = colMeans(LOPS,            na.rm = TRUE),
+  LCA  = colMeans(C_solar_mc_mat,  na.rm = TRUE)
+) %>%
+  pivot_longer(
+    cols      = c(Burn, Soft, Hard, LoPS, LCA),
+    names_to  = "component",
+    values_to = "value"
+  )
+
+# ---- 2) Component totals (2005–2054) across years, per MC iteration ----
+# Each "tot_*_draw" is length n_iter
+tot_burn_draw <- rowSums(E_burn,         na.rm = TRUE)
+tot_soft_draw <- rowSums(E_soft,         na.rm = TRUE)
+tot_hard_draw <- rowSums(E_hard,         na.rm = TRUE)
+tot_lops_draw <- rowSums(LOPS,           na.rm = TRUE)
+tot_lca_draw  <- rowSums(C_solar_mc_mat, na.rm = TRUE)
+
+# Summarize a draw vector into mean and 95% CI half-width
+summ_ci <- function(x){
+  qs <- quantile(x, c(0.025, 0.975), na.rm = TRUE)
+  m  <- mean(x, na.rm = TRUE)
+  hw <- (qs[2] - qs[1]) / 2
+  list(mean = m, hw = hw)
+}
+
+S_burn <- summ_ci(tot_burn_draw)
+S_soft <- summ_ci(tot_soft_draw)
+S_hard <- summ_ci(tot_hard_draw)
+S_lops <- summ_ci(tot_lops_draw)
+S_lca  <- summ_ci(tot_lca_draw)
+
+# Totals text box (mean ± half-width of 95% CI)
+fmt <- function(v) comma(v, accuracy = 1)
+lbl_ci <- paste0(
+  "Totals 2005–2054 (Mg C), 95% CI\n",
+  "Burn: ", fmt(S_burn$mean), " \u00B1 ", fmt(S_burn$hw), "\n",
+  "Soft: ", fmt(S_soft$mean), " \u00B1 ", fmt(S_soft$hw), "\n",
+  "Hard: ", fmt(S_hard$mean), " \u00B1 ", fmt(S_hard$hw), "\n",
+  "LoPS: ", fmt(S_lops$mean), " \u00B1 ", fmt(S_lops$hw), "\n",
+  "LCA:  ", fmt(S_lca$mean),  " \u00B1 ", fmt(S_lca$hw)
+)
+
+# ---- 3) Positioning helper for the annotation box (top-right) ----
+y_top <- df_emis_stack %>%
+  group_by(year) %>%
+  summarise(y_sum = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  summarise(max_sum = max(y_sum, na.rm = TRUE)) %>%
+  pull(max_sum)
+
+# ---- 4) Stacked plot ----
+p07 <- ggplot(df_emis_stack, aes(x = year, y = value, fill = component)) +
+  geom_col(width = 0.9) +
+  scale_fill_manual(values = c(
+    "Burn" = "#D55E00",  # immediate emissions
+    "Soft" = "#009E73",  # softwood decay
+    "Hard" = "#CC79A7",  # hardwood decay
+    "LoPS" = "#F0E442",  # lost potential sequestration
+    "LCA"  = "#636363"   # solar LCA (install + end-of-life)
+  )) +
+  scale_x_continuous(breaks = pretty(df_emis_stack$year, n = 12)) +
+  scale_y_continuous(
+    limits = c(0, 2e5),                    # keep your fixed axis range
+    labels = scales::label_scientific(),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "Total carbon emissions: Biomass (burn/soft/hard) + LoPS + LCA",
+    x = "Year",
+    y = expression("Flux (Mg C "*yr^{-1}*")"),
+    fill = NULL
+  ) +
+  annotate(
+    "label",
+    x = max(df_emis_stack$year) - 0.6,
+    y = y_top * 0.985,
+    hjust = 1, vjust = 1,
+    label = lbl_ci,
+    size = 6,
+    label.size = 0.35,
+    fill = "white",
+    alpha = 0.96
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text  = element_text(size = 14),
+    legend.position = "bottom"
+  )
+
+p07
+
+# ---- 5) Save figure ----
+#ggsave(
+#  filename = "07. Total carbon emissions_stacked_with_LCA.png",
+#  plot     = p07,
+#  width    = 12,
+#  height   = 7,
+#  dpi      = 300,
+#  bg       = "white"
+#)
+
+
+```
+
+```{r}
+
+# ============================================================
+# Plot 08 — Total annual emissions including LCA
+# - Components included: Burn + Soft + Hard + LoPS + LCA
+# - Steps:
+#   1) Build total emissions matrix (per MC iteration × year)
+#   2) Summarize annual mean and 95% CI
+#   3) Summarize cumulative total (2005–2054) with 95% CI
+#   4) Plot annual mean with CI ribbon and totals annotation
+#   5) Save figure
+# ============================================================
+
+# ---- 0) Build total emissions matrix (n_iter x years_full) ----
+E_total_LCA <- E_burn + E_soft + E_hard + LOPS + C_solar_mc_mat
+yrs <- as.integer(colnames(E_total_LCA))
+
+# ---- 1) Convert MC matrix → annual mean and 95% CI ----
+mat_to_ci <- function(mat){
+  qs <- apply(mat, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+  tibble(
+    year = as.integer(colnames(mat)),
+    mean = colMeans(mat, na.rm = TRUE),
+    lo   = as.numeric(qs[1, ]),
+    hi   = as.numeric(qs[2, ])
+  ) %>% arrange(year)
+}
+df_total_ci <- mat_to_ci(E_total_LCA)
+
+# ---- 2) Cumulative total over 2005–2054 (mean ± 95% CI half-width) ----
+tot_draw <- rowSums(E_total_LCA, na.rm = TRUE)
+qs <- quantile(tot_draw, c(0.025, 0.975), na.rm = TRUE)
+mu <- mean(tot_draw, na.rm = TRUE)
+hw <- (qs[2] - qs[1]) / 2
+
+lbl_total <- paste0(
+  "Total emissions 2005–2054 (Mg C) incl. LCA, 95% CI\n",
+  comma(mu, accuracy = 1), " \u00B1 ", comma(hw, accuracy = 1)
+)
+
+# ---- 3) Annual plot with 95% CI ribbon ----
+y_max <- max(df_total_ci$hi, na.rm = TRUE)
+
+p_total_lca <-
+  ggplot(df_total_ci, aes(x = year, y = mean)) +
+  geom_col(width = 0.9, fill = "red", alpha = 0.95) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#6baed6", alpha = 0.25) +
+  geom_line(aes(y = lo), linetype = "dotdash", linewidth = 0.6) +
+  geom_line(aes(y = hi), linetype = "dotdash", linewidth = 0.6) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  scale_x_continuous(breaks = pretty(df_total_ci$year, n = 12)) +
+  scale_y_continuous(
+    limits = c(0, 2e5),
+    labels = scales::label_scientific(),
+    expand = c(0, 0)
+  ) +
+  annotate(
+    "label",
+    x = max(df_total_ci$year) - 0.6,
+    y = y_max * 0.985,
+    hjust = 1, vjust = 1,
+    label = lbl_total,
+    size = 5.5,
+    label.size = 0.35,
+    fill = "white",
+    alpha = 0.96
+  ) +
+  labs(
+    title = "Total carbon emissions including LCA (Burn + Soft + Hard + LoPS + LCA)",
+    subtitle = "Annual mean with 95% CI (2005–2054)",
+    x = "Year",
+    y = expression("Flux (Mg C "*yr^{-1}*")")
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title    = element_text(size = 22, face = "bold"),
+    plot.subtitle = element_text(size = 16),
+    axis.title    = element_text(size = 18),
+    axis.text     = element_text(size = 14)
+  )
+
+p_total_lca
+
+# ---- 4) Save figure ----
+#ggsave(
+#  "08. Total emissions incl LCA with 95% CI.png",
+#  p_total_lca,
+#  width = 12,
+#  height = 4,
+#  dpi = 300,
+#  bg = "white"
+#)
+
+
+```
+
+```{r}
+
+# ============================================================
+# Plot - Net carbon emissions (stacked)
+# Components: Burn + Soft + Hard + LoPS + LCA + Avoided
+# - Inputs (MC matrices; n_iter x years_full):
+#   E_burn, E_soft, E_hard, LOPS, C_solar_mc_mat, C_avoided_mc_mat_s2
+# - Outputs:
+#   (1) Stacked annual mean plot
+#   (2) Totals box showing 2005–2054 totals with 95% CI (half-width)
+#   (3) Saved as PNG
+# ============================================================
+
+# ---- 1) Annual mean by component (for stacked bars) ----
+df_net_stack <- tibble(
+  year    = as.integer(years_full),
+  Burn    = colMeans(E_burn,              na.rm = TRUE),
+  Soft    = colMeans(E_soft,              na.rm = TRUE),
+  Hard    = colMeans(E_hard,              na.rm = TRUE),
+  LoPS    = colMeans(LOPS,                na.rm = TRUE),
+  LCA     = colMeans(C_solar_mc_mat,      na.rm = TRUE),
+  Avoided = colMeans(C_avoided_mc_mat_s2, na.rm = TRUE)   # typically negative
+) %>%
+  pivot_longer(
+    cols      = c(Burn, Soft, Hard, LoPS, LCA, Avoided),
+    names_to  = "component",
+    values_to = "value"
+  )
+
+# ---- 2) Totals over 2005–2054 with 95% CI (half-width) ----
+# Total per iteration = row-sum across years
+tot_burn_draw    <- rowSums(E_burn,              na.rm = TRUE)
+tot_soft_draw    <- rowSums(E_soft,              na.rm = TRUE)
+tot_hard_draw    <- rowSums(E_hard,              na.rm = TRUE)
+tot_lops_draw    <- rowSums(LOPS,                na.rm = TRUE)
+tot_lca_draw     <- rowSums(C_solar_mc_mat,      na.rm = TRUE)
+tot_avoided_draw <- rowSums(C_avoided_mc_mat_s2, na.rm = TRUE)
+tot_net_draw     <- tot_burn_draw + tot_soft_draw + tot_hard_draw +
+                    tot_lops_draw + tot_lca_draw + tot_avoided_draw
+
+# mean and 95% CI half-width from MC samples
+summ_ci <- function(x){
+  qs <- quantile(x, c(0.025, 0.975), na.rm = TRUE)
+  m  <- mean(x, na.rm = TRUE)
+  hw <- (qs[2] - qs[1]) / 2
+  list(mean = m, hw = hw)
+}
+
+S_burn    <- summ_ci(tot_burn_draw)
+S_soft    <- summ_ci(tot_soft_draw)
+S_hard    <- summ_ci(tot_hard_draw)
+S_lops    <- summ_ci(tot_lops_draw)
+S_lca     <- summ_ci(tot_lca_draw)
+S_avoided <- summ_ci(tot_avoided_draw)
+S_net     <- summ_ci(tot_net_draw)  # available if you want to print Net too
+
+fmt <- function(v) comma(v, accuracy = 1)
+
+# Annotation box text (includes Avoided total 95% CI)
+lbl_ci <- paste0(
+  "Totals 2005–2054 (Mg C), 95% CI\n",
+  "Burn: ",    fmt(S_burn$mean),    " \u00B1 ", fmt(S_burn$hw),    "\n",
+  "Soft: ",    fmt(S_soft$mean),    " \u00B1 ", fmt(S_soft$hw),    "\n",
+  "Hard: ",    fmt(S_hard$mean),    " \u00B1 ", fmt(S_hard$hw),    "\n",
+  "LoPS: ",    fmt(S_lops$mean),    " \u00B1 ", fmt(S_lops$hw),    "\n",
+  "LCA:  ",    fmt(S_lca$mean),     " \u00B1 ", fmt(S_lca$hw),     "\n",
+  "Avoided: ", fmt(S_avoided$mean), " \u00B1 ", fmt(S_avoided$hw)
+)
+
+# ---- 3) Get a reasonable y location for the totals box ----
+# Sum of components per year (used only to find a top-ish y reference)
+y_top <- df_net_stack %>%
+  group_by(year) %>%
+  summarise(y_sum = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  summarise(max_sum = max(y_sum)) %>%
+  pull(max_sum)
+
+# ---- 4) Plot: stacked annual means + totals box ----
+p14 <- ggplot(df_net_stack, aes(x = year, y = value, fill = component)) +
+  geom_col(width = 0.9) +
+  scale_fill_manual(values = c(
+    "Burn"    = "#D55E00",  # immediate emissions
+    "Soft"    = "#009E73",  # softwood decay
+    "Hard"    = "#CC79A7",  # hardwood decay
+    "LoPS"    = "#F0E442",  # lost potential sequestration
+    "LCA"     = "#636363",  # solar LCA (install + EoL)
+    "Avoided" = "#1f77b4"   # avoided emissions (savings; negative)
+  )) +
+  scale_x_continuous(breaks = pretty(df_net_stack$year, n = 12)) +
+  scale_y_continuous(
+    limits = c(-5e5, 7.5e5),
+    labels = scales::label_scientific(),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "Net carbon emissions: Biomass + LoPS + LCA − Avoided",
+    x = "Year",
+    y = expression("Flux (Mg C "*yr^{-1}*")"),
+    fill = NULL
+  ) +
+  annotate(
+    "label",
+    x = max(df_net_stack$year) - 0.6,
+    y = 5e5,                 # fixed y (keep your original choice)
+    hjust = 1, vjust = 1,
+    label = lbl_ci,
+    size = 4,
+    label.size = 0.35,
+    fill = "white",
+    alpha = 0.96
+  ) +
+  theme_minimal(base_size = 16) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE)) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text  = element_text(size = 14),
+    legend.position  = "bottom",
+    legend.direction = "horizontal"
+  )
+
+p14
+
+# ---- 5) Save figure ----
+#ggsave(
+#  filename = "14. Net carbon emissions_stacked_with_avoided.png",
+#  plot     = p14,
+#  width    = 12,
+#  height   = 7,
+#  dpi      = 300,
+#  bg       = "white"
+#)
+
+
+```
+
+```{r}
+
+# ---- 1) Build net annual carbon impact matrix (per-iteration) ----
+# Net = biomass emissions (burn+soft+hard) + LoPS + LCA + Avoided
+E_net <- E_burn + E_soft + E_hard + LOPS + C_solar_mc_mat + C_avoided_mc_mat_s2  # n_iter x years_full
+
+# ---- 2) Helper: summarize each year by mean and 95% CI across iterations ----
+mat_to_ci <- function(mat){
+  qs <- apply(mat, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+  tibble::tibble(
+    year = as.integer(colnames(mat)),
+    mean = colMeans(mat, na.rm = TRUE),
+    lo   = as.numeric(qs[1, ]),
+    hi   = as.numeric(qs[2, ])
+  ) %>% dplyr::arrange(year)
+}
+
+# Year-by-year summary for plotting (bar = mean, ribbon = 95% CI)
+df_net_ci <- mat_to_ci(E_net)
+
+# ---- 3) Total net impact over the full horizon (2005–2054) with 95% CI ----
+# Sum across years for each iteration → distribution of total net impact
+tot_net_draw <- rowSums(E_net, na.rm = TRUE)
+qs <- quantile(tot_net_draw, c(0.025, 0.975), na.rm = TRUE)
+mu <- mean(tot_net_draw, na.rm = TRUE)
+hw <- (qs[2] - qs[1]) / 2  # 95% CI half-width
+
+# Text for annotation box (total net impact)
+lbl_net <- paste0(
+  "Net emissions 2005–2054 (Mg C), 95% CI\n",
+  comma(mu, accuracy = 1), " \u00B1 ", comma(hw, accuracy = 1)
+)
+
+# ---- 4) Plot: annual mean bars + 95% CI ribbon + total box ----
+y_max <- max(df_net_ci$hi, na.rm = TRUE)
+
+p_net <-
+  ggplot(df_net_ci, aes(x = year, y = mean)) +
+  # Annual mean (bar)
+  geom_col(width = 0.9, fill = "lightgreen", alpha = 0.95) +
+  # 95% CI over iterations (ribbon)
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#6baed6", alpha = 0.25) +
+  # CI bounds (lines)
+  geom_line(aes(y = lo), linetype = "dotdash", linewidth = 0.6) +
+  geom_line(aes(y = hi), linetype = "dotdash", linewidth = 0.6) +
+  # Zero reference line
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  # Axes formatting
+  scale_x_continuous(breaks = pretty(df_net_ci$year, n = 12)) +
+  scale_y_continuous(
+    limits = c(-7.5e5, 5e5),
+    labels = scales::label_scientific(),
+    expand = c(0, 0)
+  ) +
+  # Annotation box (total net, 2005–2054)
+  annotate(
+    "label",
+    x = max(df_net_ci$year) - 0.6,
+    y = 3e+05,
+    hjust = 1, vjust = 1,
+    label = lbl_net,
+    size = 5.5,
+    label.size = 0.35,
+    fill = "white",
+    alpha = 0.96
+  ) +
+  labs(
+    title = "Net carbon emissions",
+    subtitle = "Annual mean with 95% CI (2005–2054)",
+    x = "Year",
+    y = expression("Flux (Mg C "*yr^{-1}*")")
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title    = element_text(size = 22, face = "bold"),
+    plot.subtitle = element_text(size = 16),
+    axis.title    = element_text(size = 18),
+    axis.text     = element_text(size = 14)
+  )
+
+p_net
+
+# ---- 5) Save ----
+#ggsave(
+#  "15. Net carbon emissions (incl avoided) with 95% CI.png",
+#  p_net, width = 12, height = 4, dpi = 300, bg = "white"
+#)
+
+
+```
+
+```{r}
+
+# ============================================================
+# Component-wise bars + 95% CI (each component)
+# ============================================================
+
+p_defor   <- plot_component_ci(mat_to_ci(E_total), "Deforestation (E_total)", "#d62728", "#d62728", base_size = 18)
+p_lops    <- plot_component_ci(mat_to_ci(LOPS), "Loss of Potential Sequestration (LoPS)", "#ff7f0e", "#ff7f0e", base_size = 18)
+p_lca     <- plot_component_ci(mat_to_ci(C_solar_mc_mat), "LCA (install & end-of-life)", "#636363", "#636363", base_size = 18)
+p_avoided <- plot_component_ci(mat_to_ci(C_avoided_mc_mat_s2), "Avoided emissions (carbon savings)", "#1f77b4", "#1f77b4", base_size = 18)
+
+p_defor; p_lops; p_lca; p_avoided
+
+```
