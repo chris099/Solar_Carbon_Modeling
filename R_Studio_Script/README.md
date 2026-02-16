@@ -23,7 +23,9 @@ The framework estimates:
 ## Repository Structure
 
 ├── MainCarbonModel/ # Main carbon bookkeeping + LCA model
+
 ├── Pre-processing/ # Input generation and parameter estimation
+
 └── README.md
 
 ---
