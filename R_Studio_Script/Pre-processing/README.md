@@ -8,7 +8,7 @@ Pre-processing outputs are required before running: MainCarbonModel/006. CarbonB
 
 ## 1. Annual Biomass Growth (FIA)
 
-File: rFIA_app.Rmd
+File: 001. rFIA_Biomass.Rmd
 
 Purpose:
 - Retrieve Massachusetts FIA plot data
@@ -24,7 +24,7 @@ Output: boot_growth2.rds
 
 ## 2. Treemap 2016 Biomass Bootstrap
 
-File: Boot_Biomass.Rmd
+File: 002. Bootstrap_Biomass.Rmd
 
 Purpose:
 - Use Treemap histogram of biomass density
@@ -39,7 +39,7 @@ Output: boot_biomass16.rds
 
 ## 3. Electricity Generation (SAM)
 
-File: Electricity Generation (SAM).Rmd
+File: 003. SAM_AnnualEGen.Rmd
 
 Purpose:
 - Import SAM simulation results
@@ -53,7 +53,7 @@ Output: sam_generation_bootstrap.rds
 
 ## 4. PV Learning Curve (LCA)
 
-File: LCA_Solar_LearningCurve.Rmd
+File: 004. PV_LearningCurve.Rmd
 
 Purpose:
 - Compile historical PV LCA estimates
@@ -67,7 +67,7 @@ Output: pv_ci_0524.rds
 
 ## 5. Grid Carbon Intensity
 
-File: GRID_Carbon Intensity.Rmd
+File: 005. ISO_NE_CI.Rmd
 
 Purpose:
 - Import ISO-NE annual carbon intensity
