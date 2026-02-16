@@ -33,10 +33,10 @@ The framework estimates:
 
 ---
 
-## Time Horizon
+## Time Period
 
 - Historical inputs: 2005–2024  
-- Simulation horizon: 2005–2054  
+- Results timeline: 2005–2054  
 - PV lifetime: 30 years  
 
 ---
@@ -55,17 +55,17 @@ The model produces:
 
 ## Citation
 
-Cho, K., Woodcock, C.E., et al.  
-*Detecting Utility-Scale Solar Installations and Associated Land Cover Changes Using Spatiotemporal Segmentation of Landsat Imagery.*  
-Science of Remote Sensing.  
+This repository contains code developed as part of Kangjoon Cho’s Ph.D. dissertation at Boston University.
 
-DOI: https://doi.org/10.xxxx/xxxxx
+Associated publications and dissertation citation details will be provided upon formal publication.
+
+For citation inquiries, please contact the author.
 
 ---
 
 ## Contact
 
-For questions regarding methodology or modeling framework, please contact:
+For questions regarding methodology or modeling framework, please contact: kangjoon@bu.edu
 
 Kangjoon Cho  
 Boston University – Department of Earth & Environment
